@@ -11,10 +11,13 @@ use log::{LevelFilter, error, info, warn};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use simplelog::{ConfigBuilder, WriteLogger};
+use xmlparser::{ElementEnd, Token, Tokenizer};
 
 struct Vm {
     id: String,
     name: String,
+    vcpus: String,
+    memory: String,
     state: String,
 }
 
@@ -35,6 +38,7 @@ struct App {
     mode: Mode,
     input: String,
     show_all: bool,
+    info_cache: Option<(String, String)>, // (vm_name, info_text)
 }
 
 impl App {
@@ -50,6 +54,24 @@ impl App {
             mode: Mode::Normal,
             input: String::new(),
             show_all,
+            info_cache: None,
+        }
+    }
+
+    fn update_info_cache(&mut self) {
+        let name = self.selected_vm().map(|vm| vm.name.clone());
+        let needs_update = match (&self.info_cache, &name) {
+            (Some((cached, _)), Some(n)) => cached != n,
+            (None, Some(_)) => true,
+            (_, None) => {
+                self.info_cache = None;
+                return;
+            }
+        };
+        if needs_update {
+            let name = name.unwrap();
+            let text = get_vm_info(&name);
+            self.info_cache = Some((name, text));
         }
     }
 
@@ -62,6 +84,8 @@ impl App {
             let idx = selected.unwrap_or(0).min(self.vms.len() - 1);
             self.table_state.select(Some(idx));
         }
+        self.info_cache = None;
+        self.update_info_cache();
     }
 
     fn next(&mut self) {
@@ -91,6 +115,7 @@ impl App {
         };
         self.table_state.select(Some(i));
     }
+
 }
 
 fn get_vm_list(show_all: bool) -> Vec<Vm> {
@@ -117,7 +142,13 @@ fn get_vm_list(show_all: bool) -> Vec<Vm> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let vms = parse_virsh_output(&stdout);
+    let mut vms = parse_virsh_output(&stdout);
+    for vm in &mut vms {
+        if let Some((vcpus, memory)) = get_vm_resources(&vm.name) {
+            vm.vcpus = vcpus;
+            vm.memory = memory;
+        }
+    }
     info!("Parsed {} VMs from virsh output", vms.len());
     vms
 }
@@ -131,22 +162,26 @@ fn get_vm_list(show_all: bool) -> Vec<Vm> {
 ///  1    vm1        running
 ///  -    vm2        shut off
 /// ```
-/// Parse an IPv4 address from `virsh domifaddr` output.
+/// Parse IPv4 addresses from `virsh domifaddr` output.
 ///
 /// Output format:
 ///  Name       MAC address          Protocol     Address
 /// -------------------------------------------------------
 ///  vnet0      52:54:00:xx:xx:xx    ipv4         192.168.122.x/24
-fn parse_domifaddr_output(output: &str) -> Option<String> {
+fn parse_domifaddr_output(output: &str) -> Vec<String> {
+    let mut ips = Vec::new();
     for line in output.lines().skip(2) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 4 && parts[2] == "ipv4" {
             if let Some(ip) = parts[3].split('/').next() {
-                return Some(ip.to_string());
+                let ip = ip.to_string();
+                if !ips.iter().any(|v| v == &ip) {
+                    ips.push(ip);
+                }
             }
         }
     }
-    None
+    ips
 }
 
 /// Get the IP address of a VM using `virsh domifaddr`.
@@ -154,8 +189,13 @@ fn parse_domifaddr_output(output: &str) -> Option<String> {
 /// Tries multiple sources in order: default (lease), arp, then agent,
 /// because the default only works with libvirt-managed DHCP networks.
 fn get_vm_ip(name: &str) -> Option<String> {
+    get_vm_ips(name).into_iter().next()
+}
+
+fn get_vm_ips(name: &str) -> Vec<String> {
     info!("Looking up IP for VM '{name}'");
     let sources = ["lease", "arp", "agent"];
+    let mut ips = Vec::new();
     for source in sources {
         info!("Trying domifaddr --source {source} for VM '{name}'");
         let output = Command::new("virsh")
@@ -173,13 +213,128 @@ fn get_vm_ip(name: &str) -> Option<String> {
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(ip) = parse_domifaddr_output(&stdout) {
-            info!("Resolved VM '{name}' -> {ip} (source: {source})");
-            return Some(ip);
+        for ip in parse_domifaddr_output(&stdout) {
+            if !ips.iter().any(|v| v == &ip) {
+                info!("Resolved VM '{name}' -> {ip} (source: {source})");
+                ips.push(ip);
+            }
         }
     }
-    warn!("No IPv4 address found for VM '{name}' from any source");
-    None
+    if ips.is_empty() {
+        warn!("No IPv4 address found for VM '{name}' from any source");
+    }
+    ips
+}
+
+/// Get VM details from `virsh dumpxml`.
+fn get_vm_info(name: &str) -> String {
+    let ip_text = {
+        let ips = get_vm_ips(name);
+        if ips.is_empty() {
+            "N/A".to_string()
+        } else {
+            ips.join(", ")
+        }
+    };
+    format!("IPs: {ip_text}\n{}", get_dumpxml_summary(name))
+}
+
+fn get_dumpxml_summary(name: &str) -> String {
+    let output = Command::new("virsh").args(["dumpxml", name]).output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let raw_xml = String::from_utf8_lossy(&o.stdout);
+            summarize_dumpxml(&raw_xml).unwrap_or_else(|_| format!("(unable to parse dumpxml for '{name}')"))
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            format!("(dumpxml failed for '{name}': {stderr})")
+        }
+        Err(e) => format!("(unable to run dumpxml for '{name}': {e})"),
+    }
+}
+
+fn get_vm_resources(name: &str) -> Option<(String, String)> {
+    let output = Command::new("virsh").args(["dumpxml", name]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw_xml = String::from_utf8_lossy(&output.stdout);
+    parse_dumpxml_resources(&raw_xml).ok().map(|(vcpu, memory)| {
+        (
+            vcpu.unwrap_or_else(|| "N/A".to_string()),
+            memory.unwrap_or_else(|| "N/A".to_string()),
+        )
+    })
+}
+
+fn parse_dumpxml_resources(
+    xml: &str,
+) -> Result<(Option<String>, Option<String>), xmlparser::Error> {
+    let mut stack: Vec<String> = Vec::new();
+    let mut vcpu: Option<String> = None;
+    let mut memory: Option<String> = None;
+    let mut memory_unit: Option<String> = None;
+
+    for token in Tokenizer::from(xml) {
+        let token = token?;
+        match token {
+            Token::ElementStart { local, .. } => {
+                stack.push(local.as_str().to_string());
+            }
+            Token::Attribute { local, value, .. } => {
+                if matches!(stack.last().map(String::as_str), Some("memory"))
+                    && local.as_str() == "unit"
+                {
+                    memory_unit = Some(value.as_str().to_string());
+                }
+            }
+            Token::Text { text } => {
+                let value = text.as_str().trim();
+                if !value.is_empty()
+                    && vcpu.is_none()
+                    && matches!(stack.last().map(String::as_str), Some("vcpu"))
+                {
+                    vcpu = Some(value.to_string());
+                } else if !value.is_empty()
+                    && memory.is_none()
+                    && matches!(stack.last().map(String::as_str), Some("memory"))
+                {
+                    memory = Some(value.to_string());
+                }
+            }
+            Token::ElementEnd { end, .. } => match end {
+                ElementEnd::Open => {}
+                ElementEnd::Empty | ElementEnd::Close(_, _) => {
+                    let _ = stack.pop();
+                }
+            },
+            _ => {}
+        }
+    }
+
+    let memory_mib = memory
+        .as_deref()
+        .and_then(|v| convert_memory_to_mib(v, memory_unit.as_deref()));
+    Ok((vcpu, memory_mib))
+}
+
+fn convert_memory_to_mib(value: &str, unit: Option<&str>) -> Option<String> {
+    let amount = value.parse::<f64>().ok()?;
+    let unit = unit.unwrap_or("KiB").to_ascii_lowercase();
+    let mib = match unit.as_str() {
+        "kib" => amount / 1024.0,
+        "mib" => amount,
+        "gib" => amount * 1024.0,
+        "b" | "byte" | "bytes" => amount / (1024.0 * 1024.0),
+        _ => return None,
+    };
+    let formatted = if (mib.fract()).abs() < 0.01 {
+        format!("{mib:.0}")
+    } else {
+        format!("{mib:.1}")
+    };
+    Some(format!("{formatted} MiB"))
 }
 
 fn parse_virsh_output(output: &str) -> Vec<Vm> {
@@ -194,6 +349,8 @@ fn parse_virsh_output(output: &str) -> Vec<Vm> {
             vms.push(Vm {
                 id: parts[0].to_string(),
                 name: parts[1].to_string(),
+                vcpus: "N/A".to_string(),
+                memory: "N/A".to_string(),
                 state: parts[2..].join(" "),
             });
         }
@@ -244,6 +401,7 @@ fn main() -> io::Result<()> {
     info!("yalv-rust started with args: {:?}", args);
 
     let mut app = App::new(true);
+    app.update_info_cache();
     info!("Loaded {} VMs (show_all=true)", app.vms.len());
 
     enable_raw_mode()?;
@@ -284,6 +442,174 @@ fn run_ssh(
     Ok(())
 }
 
+fn summarize_dumpxml(xml: &str) -> Result<String, xmlparser::Error> {
+    #[derive(Default)]
+    struct DiskInfo {
+        is_disk: bool,
+        target: Option<String>,
+        source: Option<String>,
+    }
+    #[derive(Default)]
+    struct InterfaceInfo {
+        fields: Vec<String>,
+    }
+
+    let mut stack: Vec<String> = Vec::new();
+    let mut emulator: Option<String> = None;
+    let mut networks: Vec<String> = Vec::new();
+    let mut interfaces: Vec<String> = Vec::new();
+    let mut disks: Vec<String> = Vec::new();
+    let mut current_disk: Option<DiskInfo> = None;
+    let mut current_interface: Option<InterfaceInfo> = None;
+
+    for token in Tokenizer::from(xml) {
+        let token = token?;
+        match token {
+            Token::ElementStart { local, .. } => {
+                let name = local.as_str().to_string();
+                if name == "disk" {
+                    current_disk = Some(DiskInfo::default());
+                } else if name == "interface" {
+                    current_interface = Some(InterfaceInfo::default());
+                }
+                stack.push(name);
+            }
+            Token::Attribute { local, value, .. } => {
+                if let Some(elem) = stack.last().map(String::as_str) {
+                    if let Some(disk) = current_disk.as_mut() {
+                        if elem == "disk" && local.as_str() == "device" && value.as_str() == "disk" {
+                            disk.is_disk = true;
+                        } else if elem == "target" && local.as_str() == "dev" {
+                            disk.target = Some(value.as_str().to_string());
+                        } else if elem == "source"
+                            && matches!(
+                                local.as_str(),
+                                "file" | "dev" | "name" | "volume" | "path"
+                            )
+                            && disk.source.is_none()
+                        {
+                            disk.source = Some(value.as_str().to_string());
+                        }
+                    }
+                    if let Some(interface) = current_interface.as_mut() {
+                        let skip_field = elem == "address"
+                            && matches!(
+                                local.as_str(),
+                                "type" | "domain" | "bus" | "slot" | "function"
+                            );
+                        if skip_field {
+                            continue;
+                        }
+                        let field = if elem == "interface" {
+                            format!("{}={}", local.as_str(), value.as_str())
+                        } else {
+                            format!("{}.{}={}", elem, local.as_str(), value.as_str())
+                        };
+                        if !interface.fields.iter().any(|f| f == &field) {
+                            interface.fields.push(field);
+                        }
+                    }
+                    if elem == "source"
+                        && matches!(stack.iter().rev().nth(1).map(String::as_str), Some("interface"))
+                        && matches!(local.as_str(), "network" | "bridge" | "dev")
+                    {
+                        let source = value.as_str();
+                        if !networks.iter().any(|n| n == source) {
+                            networks.push(source.to_string());
+                        }
+                    }
+                }
+            }
+            Token::Text { text } => {
+                let value = text.as_str().trim();
+                if value.is_empty() {
+                    continue;
+                }
+                if let Some(elem) = stack.last().map(String::as_str) {
+                    if elem == "emulator" && emulator.is_none() {
+                        emulator = Some(value.to_string());
+                    }
+                }
+                if let Some(interface) = current_interface.as_mut() {
+                    if let Some(elem) = stack.last().map(String::as_str) {
+                        let field = format!("{elem}={value}");
+                        if !interface.fields.iter().any(|f| f == &field) {
+                            interface.fields.push(field);
+                        }
+                    }
+                }
+            }
+            Token::ElementEnd { end, .. } => match end {
+                ElementEnd::Open => {}
+                ElementEnd::Empty => {
+                    if let Some(closed) = stack.pop() {
+                        if closed == "interface" {
+                            if let Some(interface) = current_interface.take() {
+                                if interface.fields.is_empty() {
+                                    interfaces.push("N/A".to_string());
+                                } else {
+                                    interfaces.push(interface.fields.join(", "));
+                                }
+                            }
+                        } else if closed == "disk" {
+                            if let Some(disk) = current_disk.take() {
+                                if disk.is_disk {
+                                    let target = disk.target.unwrap_or_else(|| "unknown".to_string());
+                                    let source = disk.source.unwrap_or_else(|| "unknown".to_string());
+                                    disks.push(format!("{target}: {source}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                ElementEnd::Close(_, _) => {
+                    if let Some(closed) = stack.pop() {
+                        if closed == "interface" {
+                            if let Some(interface) = current_interface.take() {
+                                if interface.fields.is_empty() {
+                                    interfaces.push("N/A".to_string());
+                                } else {
+                                    interfaces.push(interface.fields.join(", "));
+                                }
+                            }
+                        } else if closed == "disk" {
+                            if let Some(disk) = current_disk.take() {
+                                if disk.is_disk {
+                                    let target = disk.target.unwrap_or_else(|| "unknown".to_string());
+                                    let source = disk.source.unwrap_or_else(|| "unknown".to_string());
+                                    disks.push(format!("{target}: {source}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    let emulator_text = emulator.unwrap_or_else(|| "N/A".to_string());
+    let network_text = if networks.is_empty() {
+        "N/A".to_string()
+    } else {
+        networks.join(", ")
+    };
+    let interface_text = if interfaces.is_empty() {
+        "N/A".to_string()
+    } else {
+        interfaces.join(", ")
+    };
+    let disk_text = if disks.is_empty() {
+        "N/A".to_string()
+    } else {
+        disks.join(", ")
+    };
+
+    Ok(format!(
+        "Network: {network_text}\nInterfaces: {interface_text}\nEmulator: {emulator_text}\nDisks: {disk_text}"
+    ))
+}
+
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
@@ -306,8 +632,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         info!("Quit requested");
                         return Ok(());
                     }
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.next();
+                        app.update_info_cache();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.previous();
+                        app.update_info_cache();
+                    }
                     KeyCode::Enter => {
                         if let Some(vm) = app.selected_vm() {
                             if vm.state == "running" {
@@ -435,14 +767,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    let show_bottom = matches!(app.mode, Mode::SshInput { .. } | Mode::Confirm { .. });
+    let show_prompt = matches!(app.mode, Mode::SshInput { .. } | Mode::Confirm { .. });
+    let has_info = app.info_cache.is_some();
+    let mut constraints = vec![Constraint::Min(1)];
+    if has_info {
+        constraints.push(Constraint::Length(10));
+    }
+    if show_prompt {
+        constraints.push(Constraint::Length(3));
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if show_bottom {
-            vec![Constraint::Min(1), Constraint::Length(3)]
-        } else {
-            vec![Constraint::Min(1)]
-        })
+        .constraints(constraints)
         .split(f.area());
 
     let rows: Vec<Row> = app
@@ -458,18 +794,22 @@ fn ui(f: &mut Frame, app: &mut App) {
             Row::new(vec![
                 Cell::from(vm.id.clone()),
                 Cell::from(vm.name.clone()),
+                Cell::from(vm.vcpus.clone()),
+                Cell::from(vm.memory.clone()),
                 Cell::from(vm.state.clone()).style(state_style),
             ])
         })
         .collect();
 
-    let header = Row::new(vec!["Id", "Name", "State"])
+    let header = Row::new(vec!["Id", "Name", "VCPUs", "Memory", "State"])
         .style(Style::default().bold())
         .bottom_margin(1);
 
     let widths = [
         Constraint::Length(6),
-        Constraint::Min(20),
+        Constraint::Min(12),
+        Constraint::Length(8),
+        Constraint::Length(12),
         Constraint::Length(15),
     ];
 
@@ -488,6 +828,19 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_stateful_widget(table, chunks[0], &mut app.table_state);
 
+    let mut next_chunk = 1;
+
+    if let Some((vm_name, info_text)) = &app.info_cache {
+        let info = Paragraph::new(info_text.as_str())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Info: {vm_name} ")),
+            );
+        f.render_widget(info, chunks[next_chunk]);
+        next_chunk += 1;
+    }
+
     match &app.mode {
         Mode::SshInput { vm_name, ip } => {
             let prompt = Paragraph::new(format!("{}|", &app.input))
@@ -496,7 +849,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                         .borders(Borders::ALL)
                         .title(format!(" SSH user for {vm_name} ({ip}) — Enter: connect, Esc: cancel ")),
                 );
-            f.render_widget(prompt, chunks[1]);
+            f.render_widget(prompt, chunks[next_chunk]);
         }
         Mode::Confirm { vm_name, action } => {
             let action_label = match action {
@@ -509,7 +862,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                         .borders(Borders::ALL)
                         .title(format!(" {action_label} VM '{vm_name}'? ")),
                 );
-            f.render_widget(prompt, chunks[1]);
+            f.render_widget(prompt, chunks[next_chunk]);
         }
         Mode::Normal => {}
     }

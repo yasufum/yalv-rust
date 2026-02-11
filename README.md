@@ -13,6 +13,17 @@ Yet Another LibVirt  client — a terminal UI for browsing and connecting to lib
 cargo build --release
 ```
 
+## Install
+
+Install from this repository with Cargo:
+
+```sh
+cargo install --path .
+```
+
+This installs `yalv-rust` to `~/.cargo/bin`.
+Make sure that directory is included in your `PATH`.
+
 ## Usage
 
 ```
