@@ -37,6 +37,8 @@ Use `--all` to include inactive VMs (same as `virsh list --all`).
 | `k` / `Up`   | Move selection up                 |
 | `Enter`      | Open console (running VMs only)   |
 | `s`          | SSH into VM (running VMs only)    |
+| `u`          | Start VM (shut off VMs only)      |
+| `d`          | Shut down VM (running VMs only)   |
 | `q` / `Esc`  | Quit                              |
 
 

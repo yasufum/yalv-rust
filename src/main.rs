@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io;
 use std::process::Command;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -17,9 +18,15 @@ struct Vm {
     state: String,
 }
 
+enum Action {
+    Start,
+    Shutdown,
+}
+
 enum Mode {
     Normal,
     SshInput { vm_name: String, ip: String },
+    Confirm { vm_name: String, action: Action },
 }
 
 struct App {
@@ -27,6 +34,7 @@ struct App {
     table_state: TableState,
     mode: Mode,
     input: String,
+    show_all: bool,
 }
 
 impl App {
@@ -41,6 +49,18 @@ impl App {
             table_state,
             mode: Mode::Normal,
             input: String::new(),
+            show_all,
+        }
+    }
+
+    fn refresh_vms(&mut self) {
+        let selected = self.table_state.selected();
+        self.vms = get_vm_list(self.show_all);
+        if self.vms.is_empty() {
+            self.table_state.select(None);
+        } else {
+            let idx = selected.unwrap_or(0).min(self.vms.len() - 1);
+            self.table_state.select(Some(idx));
         }
     }
 
@@ -196,6 +216,8 @@ fn print_help() {
     println!("    k / Up        Move selection up");
     println!("    Enter         Open console (running VMs only)");
     println!("    s             SSH into VM (running VMs only)");
+    println!("    u             Start VM (shut off VMs only)");
+    println!("    d             Shut down VM (running VMs only)");
     println!("    q / Esc       Quit");
 }
 
@@ -262,15 +284,23 @@ fn run_ssh(
     Ok(())
 }
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match &app.mode {
+        if !event::poll(REFRESH_INTERVAL)? {
+            app.refresh_vms();
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match &app.mode {
                 Mode::Normal => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         info!("Quit requested");
@@ -319,6 +349,56 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             }
                         }
                     }
+                    KeyCode::Char('u') => {
+                        if let Some(vm) = app.selected_vm() {
+                            if vm.state == "shut off" {
+                                let name = vm.name.clone();
+                                info!("Confirming start for VM '{name}'");
+                                app.mode = Mode::Confirm { vm_name: name, action: Action::Start };
+                            }
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(vm) = app.selected_vm() {
+                            if vm.state == "running" {
+                                let name = vm.name.clone();
+                                info!("Confirming shutdown for VM '{name}'");
+                                app.mode = Mode::Confirm { vm_name: name, action: Action::Shutdown };
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Mode::Confirm { vm_name, action } => match key.code {
+                    KeyCode::Char('y') => {
+                        let vm_name = vm_name.clone();
+                        let action = match action {
+                            Action::Start => "start",
+                            Action::Shutdown => "shutdown",
+                        };
+                        info!("Confirmed: virsh {action} '{vm_name}'");
+                        app.mode = Mode::Normal;
+                        let output = Command::new("virsh")
+                            .args([action, &vm_name])
+                            .output();
+                        match &output {
+                            Ok(o) if o.status.success() => {
+                                info!("virsh {action} '{vm_name}' succeeded");
+                            }
+                            Ok(o) => {
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                error!("virsh {action} '{vm_name}' failed: {stderr}");
+                            }
+                            Err(e) => {
+                                error!("Failed to run virsh {action}: {e}");
+                            }
+                        }
+                        app.refresh_vms();
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        info!("Cancelled action for VM '{vm_name}'");
+                        app.mode = Mode::Normal;
+                    }
                     _ => {}
                 },
                 Mode::SshInput { vm_name, ip } => match key.code {
@@ -346,15 +426,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     _ => {}
                 },
             }
-        }
     }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    let show_input = matches!(app.mode, Mode::SshInput { .. });
+    let show_bottom = matches!(app.mode, Mode::SshInput { .. } | Mode::Confirm { .. });
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if show_input {
+        .constraints(if show_bottom {
             vec![Constraint::Min(1), Constraint::Length(3)]
         } else {
             vec![Constraint::Min(1)]
@@ -394,20 +473,36 @@ fn ui(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Virtual Machines (q: quit, j/k: navigate, Enter: console, s: ssh) "),
+                .title(" Virtual Machines (q: quit, j/k: navigate, Enter: console, s: ssh, u: start, d: shutdown) "),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(table, chunks[0], &mut app.table_state);
 
-    if let Mode::SshInput { vm_name, ip } = &app.mode {
-        let prompt = Paragraph::new(format!("{}|", &app.input))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" SSH user for {vm_name} ({ip}) — Enter: connect, Esc: cancel ")),
-            );
-        f.render_widget(prompt, chunks[1]);
+    match &app.mode {
+        Mode::SshInput { vm_name, ip } => {
+            let prompt = Paragraph::new(format!("{}|", &app.input))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" SSH user for {vm_name} ({ip}) — Enter: connect, Esc: cancel ")),
+                );
+            f.render_widget(prompt, chunks[1]);
+        }
+        Mode::Confirm { vm_name, action } => {
+            let action_label = match action {
+                Action::Start => "Start",
+                Action::Shutdown => "Shut down",
+            };
+            let prompt = Paragraph::new("y / n")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {action_label} VM '{vm_name}'? ")),
+                );
+            f.render_widget(prompt, chunks[1]);
+        }
+        Mode::Normal => {}
     }
 }
