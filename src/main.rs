@@ -218,6 +218,7 @@ fn print_help() {
     println!("    s             SSH into VM (running VMs only)");
     println!("    u             Start VM (shut off VMs only)");
     println!("    d             Shut down VM (running VMs only)");
+    println!("    A             Toggle between all / running VMs");
     println!("    q / Esc       Quit");
 }
 
@@ -242,9 +243,8 @@ fn main() -> io::Result<()> {
     init_logger();
     info!("yalv-rust started with args: {:?}", args);
 
-    let show_all = args.iter().any(|a| a == "--all");
-    let mut app = App::new(show_all);
-    info!("Loaded {} VMs (show_all={})", app.vms.len(), show_all);
+    let mut app = App::new(true);
+    info!("Loaded {} VMs (show_all=true)", app.vms.len());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -357,6 +357,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 app.mode = Mode::Confirm { vm_name: name, action: Action::Start };
                             }
                         }
+                    }
+                    KeyCode::Char('A') => {
+                        app.show_all = !app.show_all;
+                        info!("Toggled show_all to {}", app.show_all);
+                        app.refresh_vms();
                     }
                     KeyCode::Char('d') => {
                         if let Some(vm) = app.selected_vm() {
@@ -473,7 +478,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Virtual Machines (q: quit, j/k: navigate, Enter: console, s: ssh, u: start, d: shutdown) "),
+                .title(format!(
+                    " Virtual Machines [{}] (q: quit, j/k: navigate, Enter: console, s: ssh, u: start, d: shutdown, A: toggle all) ",
+                    if app.show_all { "all" } else { "running" }
+                )),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(">> ");
