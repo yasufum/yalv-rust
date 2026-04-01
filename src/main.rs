@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::process::Command;
@@ -38,7 +39,7 @@ struct App {
     mode: Mode,
     input: String,
     show_all: bool,
-    info_cache: Option<(String, String)>, // (vm_name, info_text)
+    info_cache: HashMap<String, String>, // vm_name -> info_text
 }
 
 impl App {
@@ -54,25 +55,35 @@ impl App {
             mode: Mode::Normal,
             input: String::new(),
             show_all,
-            info_cache: None,
+            info_cache: HashMap::new(),
         }
     }
 
+    /// Ensure the selected VM has a cache entry. Fetches only on first visit.
     fn update_info_cache(&mut self) {
-        let name = self.selected_vm().map(|vm| vm.name.clone());
-        let needs_update = match (&self.info_cache, &name) {
-            (Some((cached, _)), Some(n)) => cached != n,
-            (None, Some(_)) => true,
-            (_, None) => {
-                self.info_cache = None;
-                return;
+        if let Some(name) = self.selected_vm().map(|vm| vm.name.clone()) {
+            if !self.info_cache.contains_key(&name) {
+                let text = get_vm_info(&name);
+                self.info_cache.insert(name, text);
             }
-        };
-        if needs_update {
-            let name = name.unwrap();
-            let text = get_vm_info(&name);
-            self.info_cache = Some((name, text));
         }
+    }
+
+    /// Re-fetch info for the selected VM (called on periodic refresh).
+    fn refresh_info_cache(&mut self) {
+        if let Some(name) = self.selected_vm().map(|vm| vm.name.clone()) {
+            let text = get_vm_info(&name);
+            self.info_cache.insert(name, text);
+        }
+    }
+
+    /// Return cached info for the currently selected VM.
+    fn selected_info(&self) -> Option<(&str, &str)> {
+        self.selected_vm().and_then(|vm| {
+            self.info_cache
+                .get(&vm.name)
+                .map(|text| (vm.name.as_str(), text.as_str()))
+        })
     }
 
     fn refresh_vms(&mut self) {
@@ -84,8 +95,12 @@ impl App {
             let idx = selected.unwrap_or(0).min(self.vms.len() - 1);
             self.table_state.select(Some(idx));
         }
-        self.info_cache = None;
-        self.update_info_cache();
+        // Remove cache entries for VMs that no longer exist.
+        let vm_names: std::collections::HashSet<&str> =
+            self.vms.iter().map(|vm| vm.name.as_str()).collect();
+        self.info_cache.retain(|name, _| vm_names.contains(name.as_str()));
+        // Re-fetch info for the currently selected VM.
+        self.refresh_info_cache();
     }
 
     fn next(&mut self) {
@@ -768,7 +783,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
 fn ui(f: &mut Frame, app: &mut App) {
     let show_prompt = matches!(app.mode, Mode::SshInput { .. } | Mode::Confirm { .. });
-    let has_info = app.info_cache.is_some();
+    let info_for_display: Option<(String, String)> = app.selected_info()
+        .map(|(name, text)| (name.to_string(), text.to_string()));
+    let has_info = info_for_display.is_some();
     let mut constraints = vec![Constraint::Min(1)];
     if has_info {
         constraints.push(Constraint::Length(10));
@@ -830,7 +847,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     let mut next_chunk = 1;
 
-    if let Some((vm_name, info_text)) = &app.info_cache {
+    if let Some((vm_name, info_text)) = &info_for_display {
         let info = Paragraph::new(info_text.as_str())
             .block(
                 Block::default()
