@@ -40,6 +40,14 @@ yalv-rust [OPTIONS]
 By default, only running VMs are listed (same as `virsh list`).
 Use `--all` to include inactive VMs (same as `virsh list --all`).
 
+### Info pane
+
+Selecting a VM opens a detail pane at the bottom of the screen showing
+its configuration and resource information (fetched via `virsh dominfo`
+and related commands). The data for each VM is fetched once and cached,
+so navigating back to a previously visited VM displays the info instantly.
+The cache is refreshed automatically on periodic VM list updates.
+
 ### Keybindings
 
 | Key          | Action                            |
