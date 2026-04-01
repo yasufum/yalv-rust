@@ -68,4 +68,4 @@ This tool is generated with Claude Code.
 
 ## License
 
-TBD
+[BSD 3-Clause](LICENSE)
